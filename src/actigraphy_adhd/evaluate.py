@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr, wilcoxon
+from scipy.stats import t as stats_t
 from statsmodels.stats.multitest import multipletests
 from sklearn.base import clone
 from sklearn.metrics import (average_precision_score, brier_score_loss,
@@ -13,10 +14,25 @@ from sklearn.model_selection import (GridSearchCV, RepeatedStratifiedKFold,
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .models import base_lr, clf_t, models, preprocess
+from .models import base_lr, clf_t, clf_t_unweighted, models, preprocess
 
 
-def evaluate(df, cov):
+def build_pipe(preprocessor, model, selector=None):
+    """Preprocess, scale, optionally select, then the model.
+
+    The selector sits inside the pipeline so cross_validate and
+    cross_val_predict refit it on each training fold.
+    """
+    steps = [('preprocessor', preprocessor), ("scale", StandardScaler())]
+
+    if selector is not None:
+        steps.append(("select", clone(selector)))
+
+    steps.append(("model", model))
+    return Pipeline(steps)
+
+
+def evaluate(df, cov, selector=None):
     """Exploratory Eval."""
     X, y, preprocessor = preprocess(df, cov)
 
@@ -31,11 +47,7 @@ def evaluate(df, cov):
 
     for name, model in models.items():
         print(f'{name}...')
-        pipe = Pipeline([
-            ('preprocessor', preprocessor),
-            ("scale", StandardScaler()),
-            ("model", model)
-        ])
+        pipe = build_pipe(preprocessor, model, selector)
 
         scores = cross_validate(
             pipe,
@@ -78,16 +90,29 @@ def lr_scores(roc_scores):
     return next(r['scores'] for r in roc_scores if r['model'] == 'LR')
 
 
-def wilcoxon_test(strat, non):
-    """Feature set comparison with Wilcoxon signed-rank test (RQ2).
+def rq2_test(strat, non, n_train, n_test):
+    """Feature set comparison (RQ2).
 
     Run with best non- and best stratified features sets (both from auto).
     RQ1 is reported descriptively and is not significance tested.
+
+    Folds from repeated k-fold share training data, so their scores are not
+    independent and Wilcoxon is too liberal. The corrected resampled t-test
+    inflates the variance by n_test/n_train to account for the overlap
+    (Nadeau & Bengio, 2003). Wilcoxon is reported alongside.
     """
     diff = strat - non
-    stat, p = wilcoxon(diff)
-    print(f"Wilcoxon signed-rank p = {p:.4f}")
-    return {"mean_diff": diff.mean(), "statistic": stat, "p": p}
+    j = len(diff)
+    var = diff.var(ddof=1)
+
+    t_stat = diff.mean() / np.sqrt((1 / j + n_test / n_train) * var) if var > 0 else np.inf
+    p = 2 * stats_t.sf(abs(t_stat), df=j - 1)
+
+    stat, wilcox_p = wilcoxon(diff)
+    print(f"corrected resampled t-test p = {p:.4f} (Wilcoxon p = {wilcox_p:.4f})")
+
+    return {"mean_diff": diff.mean(), "t": t_stat, "df": j - 1,
+            "p": p, "wilcoxon_statistic": stat, "wilcoxon_p": wilcox_p}
 
 
 def get_coefs(df, cov):
@@ -186,15 +211,11 @@ def tune(df, cov):
     ]
 
 
-def out_of_fold(df, cov):
+def out_of_fold(df, cov, selector=None, model=None):
     """Get out-of-fold predicted probabilities from the tuned model."""
     X, y, preprocessor = preprocess(df, cov)
 
-    pipe = Pipeline([
-        ('preprocessor', preprocessor),
-        ("scale", StandardScaler()),
-        ("model", clf_t)
-    ])
+    pipe = build_pipe(preprocessor, model if model is not None else clf_t, selector)
 
     # predictions require non-repeated cv
     oof_cv = StratifiedKFold(
@@ -254,11 +275,14 @@ def subgroup_metrics(groups, threshold):
         y_true = np.asarray(df.y)
         probs = np.asarray(df.prob)
 
-        # calibration intercept and slope model
+        # calibration slope, and calibration-in-the-large: the intercept with
+        # the slope held at 1, fitted as an offset (Van Calster et al., 2019).
+        # v1 read the intercept off the same model as the slope.
         probs = np.clip(probs, 1e-6, 1 - 1e-6)
         logit_p = np.log(probs / (1 - probs))
         X = sm.add_constant(logit_p)
         model = sm.Logit(y_true, X).fit(disp=False)
+        cil = sm.Logit(y_true, np.ones(len(y_true)), offset=logit_p).fit(disp=False)
 
         # confusion matix
         pred = probs >= threshold
@@ -270,7 +294,7 @@ def subgroup_metrics(groups, threshold):
             "roc_auc": roc_auc_score(y_true, probs),
             "pr_auc": average_precision_score(y_true, probs),
             "brier": brier_score_loss(y_true, probs),
-            "calibration_intercept": model.params[0],
+            "calibration_intercept": cil.params[0],
             "calibration_slope": model.params[1],
             "threshold": threshold,
             "sensitivity": tp / (tp + fn) if (tp + fn) else np.nan,
@@ -281,6 +305,41 @@ def subgroup_metrics(groups, threshold):
             "tn": tn,
             "fn": fn
         })
+
+    return pd.DataFrame(rows)
+
+
+def subgroup_auroc_ci(pred_df, n_boot=2000):
+    """Bootstrap interval for each sex's AUROC and for the difference.
+
+    Resampled within each group, so the interval reflects how few positive
+    cases there are among females.
+    """
+    rng = np.random.default_rng(42)
+    draws = {}
+
+    for group in ('Female', 'Male'):
+        df = pred_df[pred_df.sex.eq(group)]
+        y_true, probs = df.y.to_numpy(), df.prob.to_numpy()
+        scores = []
+
+        for _ in range(n_boot):
+            idx = rng.integers(0, len(y_true), len(y_true))
+
+            if y_true[idx].min() == y_true[idx].max():
+                scores.append(np.nan)
+            else:
+                scores.append(roc_auc_score(y_true[idx], probs[idx]))
+
+        draws[group] = np.array(scores)
+
+    diff = draws['Female'] - draws['Male']
+
+    rows = [{"group": g, "auroc_ci_low": np.nanpercentile(v, 2.5),
+             "auroc_ci_high": np.nanpercentile(v, 97.5)} for g, v in draws.items()]
+    rows.append({"group": "Female - Male",
+                 "auroc_ci_low": np.nanpercentile(diff, 2.5),
+                 "auroc_ci_high": np.nanpercentile(diff, 97.5)})
 
     return pd.DataFrame(rows)
 

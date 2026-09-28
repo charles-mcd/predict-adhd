@@ -7,6 +7,8 @@ recorded at age 7 in the UK Millennium Cohort Study (MCS). Code reproduced from 
 - presents a reproducable machine learning pipeline for fair and interpretable modelling, following the TRIPOD+AI clinical prediction framework and satisfying certain NHS RAP criteria, [see  below](#reproducible-analytical-pipeline)
 - examines whether intra-daily activity patterns and weekday/weekend differences improve prediction - relevant to condition phenotypes - and how many days of monitoring produce viable results.
 
+Tag `v1.0.0` reproduces the thesis results as submitted. This version, `v2.0.0`,
+applies improvements [listed below](#v200-iterative-improvements).
 
 ## Data access
 
@@ -15,6 +17,7 @@ The MCS data are available to registered users from the UK Data Service, files f
 - Sweep 4 (age 7); accelerometer files and daily activity summary (SN: 7238)
 - Parent interview files, sweeps 3 to 6; ADHD diagnosis question (SNs: 5795, 6411, 7464, 8156)
 - Parent interview files, sweeps 1 and 4; covariates (SNs: 4683, 6411)
+
 
 
 `scripts/prepare_data.py` reads these and produces three tables:
@@ -71,15 +74,15 @@ python scripts/run_pipeline.py --quick         # small bootstrap, separate resul
 
 | Stage | Thesis section | Description |
 |---|---|---|
-| `compare` | 4.1, 4.2 | Four feature conditions across four models, Wilcoxon test for RQ2, covariate models |
+| `compare` | 4.1, 4.2 | Four feature conditions across four models, RQ2 test, covariate models |
 | `tuning` | B4 | Hyperparameter grid search |
 | `final` | 4.3 | Out-of-fold predictions, ROC/PR curves, threshold analysis, coefficients |
 | `subgroup` | 4.4 | Sex sensitivity analysis and calibration |
 | `duration` | 4.5 | 2 to 6 day monitoring durations, paired bootstrap against 6 days |
 
-Tables and figures are written to `results/`. The slow steps are saved to
-`data/interim/` and reloaded on later runs; delete a file there to rebuild it,
-or pass `--rebuild`. Cross-validation is 5-fold repeated 5 times.
+Tables and figures are written to `results/`. Feature selection is refit inside
+every training fold, so the `compare` stage cannot be cached. The first pass, the full-sample selection and the duration feature sets are saved to `data/interim/` and reloaded on later runs; delete a file there to
+rebuild it, or pass `--rebuild`. Cross-validation is 5-fold repeated 5 times.
 
 ## Layout
 
@@ -128,6 +131,15 @@ standard for NHS and academic health data analysis.
 - [ ] Logs recorded automatically  (planned, v2.1.0)
 - [x] Tidy data output
 
+## v2.0.0: iterative improvements
+
+| Change | Reason |
+|---|---|
+| Consensus feature selection in-fold | brings feature reduction in-line with small-set feature selection methods applied within each training fold by wrapping in scikit-learn transformer, reducing leakage potential |
+| Corrected resampled t-test for RQ2 | accounts for non-independence between cross-validation folds and repeats |
+| Calibration improvements | intercept fitted with the slope held at 1 as per [Van Calster et al., 2019](https://doi.org/10.1186/s12916-019-1466-7), and the subgroup audit run on the final model's own predictions using an unweighted variant |
+| Subgroup bootstrapping  | improving precision by measuring stability of generated intervals, helpful given low prevalence i.e. only 22 positive class females |
+| Seed passed to mutual information | improves repeatability of MI used in feature selection |
 
 ## Licence
 

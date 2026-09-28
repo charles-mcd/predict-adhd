@@ -3,8 +3,10 @@
     python scripts/run_pipeline.py                 # everything
     python scripts/run_pipeline.py --stage final   # one stage
 
-Slow steps are saved to data/interim and reloaded;
-pass --rebuild to recompute them.
+Consensus feature selection is refit inside every training fold, so the
+compare stage cannot be cached. The first pass, the
+full-sample selection used for interpretation, and the duration feature sets
+are saved to data/interim; pass --rebuild to recompute them.
 """
 import argparse
 import json
@@ -14,7 +16,7 @@ import pandas as pd
 import yaml
 
 from actigraphy_adhd import data, evaluate, plots, selection
-from actigraphy_adhd.models import small_selectors
+from actigraphy_adhd.models import clf_t_unweighted, small_selectors
 
 
 def save(df, results, name):
@@ -56,26 +58,19 @@ def prepare(cfg, rebuild=False):
         'auto_str': auto_str
     }
 
-    # second pass consensus selection for auto, best single selector for hand
+    # the compare stage now selects within folds, so the only feature list
+    # needed here is the full-sample one, used for the selection matrix, the
+    # coefficients reported for interpretation, tuning and the duration study
     path = cfg['interim'] / 'selected_features.json'
 
     if path.exists() and not rebuild:
         print(f'loading {path.name}')
         fs = json.loads(path.read_text())
     else:
-        fs = {}
-
-        for name in ['auto_non', 'auto_str']:
-            print(f'\n{name}: second pass')
-            matrix = selection.second_pass(sets[name], cov)
-            matrix.to_csv(cfg['results'] / f'selection_matrix_{name}.csv')
-            fs[name] = selection.consensus(matrix)
-
-        # best selectors for the handcrafted sets, as thesis table B1
-        print('\nhand_non: mi_k5')
-        fs['hand_non'] = selection.selected_by(sets['hand_non'], cov, small_selectors['mi_k5'])
-        print('hand_str: f_classif_k5')
-        fs['hand_str'] = selection.selected_by(sets['hand_str'], cov, small_selectors['f_classif_k5'])
+        print('\nauto_str: second pass on the full sample')
+        matrix = selection.second_pass(sets['auto_str'], cov)
+        matrix.to_csv(cfg['results'] / 'selection_matrix_auto_str.csv')
+        fs = {'auto_str': selection.consensus(matrix)}
 
         path.write_text(json.dumps(fs, indent=2))
         print(f'saved {path.name}')
@@ -91,44 +86,50 @@ def compare(cfg, cov, sets, fs):
 
     for name, df in sets.items():
         print(f'\n{name}:')
-        res, scores = evaluate.evaluate(df[fs[name]], cov)
+        res, scores = evaluate.evaluate(df, cov, selection.condition_selectors[name])
         res.insert(0, 'condition', name)
         results.append(res)
         roc_scores[name] = evaluate.lr_scores(scores)
 
     save(pd.concat(results), cfg['results'], 'model_comparison')
 
-    # feature set comparison with Wilcoxon signed-rank test (RQ2)
+    # feature set comparison (RQ2)
     print('\nRQ2, tsfresh stratified vs non-stratified:')
-    test = evaluate.wilcoxon_test(roc_scores['auto_str'], roc_scores['auto_non'])
-    save(pd.DataFrame([test]), cfg['results'], 'wilcoxon_rq2')
+    n = len(cov)
+    test = evaluate.rq2_test(roc_scores['auto_str'], roc_scores['auto_non'],
+                             n * 4 / 5, n / 5)
+    save(pd.DataFrame([test]), cfg['results'], 'rq2_test')
 
-    # covariate analysis
-    best = sets['auto_str'][fs['auto_str']]
+    # covariate analysis. Covariates are always kept; the activity features
+    # are selected within folds, so the selector applies to the joined frame.
+    activity = sets['auto_str']
     cov_sets = {
         # potential causal predictors
-        'covariates': cov[['ETH', 'BMI', 'SEX']],
+        'covariates': (cov[['ETH', 'BMI', 'SEX']], None),
 
         # with best activity features
-        'covariates + auto_str': best.join(cov[['ETH', 'BMI', 'SEX']], how='inner'),
+        'covariates + auto_str': (activity.join(cov[['ETH', 'BMI', 'SEX']], how='inner'),
+                                  selection.condition_selectors['auto_str']),
 
         # all predictor variables
-        'covariates + auto_str + SDQ': best.join(cov[['ETH', 'BMI', 'SEX', 'SDQ']], how='inner')
+        'covariates + auto_str + SDQ': (activity.join(cov[['ETH', 'BMI', 'SEX', 'SDQ']], how='inner'),
+                                        selection.condition_selectors['auto_str'])
     }
 
     results = []
-    for name, df in cov_sets.items():
+    for name, (df, selector) in cov_sets.items():
         print(f'\n{name}:')
-        res, _ = evaluate.evaluate(df, cov)
+        res, _ = evaluate.evaluate(df, cov, selector)
         res.insert(0, 'feature_set', name)
         results.append(res)
 
     save(pd.concat(results), cfg['results'], 'covariate_models')
 
-    # explore coefficients with the base LR model
-    save(evaluate.get_coefs(cov_sets['covariates'], cov), cfg['results'], 'coefs_covariates')
-    save(evaluate.get_coefs(cov_sets['covariates + auto_str'], cov),
-         cfg['results'], 'coefs_covariates_auto_str')
+    # explore coefficients with the base LR model, fitted on all data
+    save(evaluate.get_coefs(cov[['ETH', 'BMI', 'SEX']], cov), cfg['results'], 'coefs_covariates')
+    save(evaluate.get_coefs(sets['auto_str'][fs['auto_str']].join(
+        cov[['ETH', 'BMI', 'SEX']], how='inner'), cov),
+        cfg['results'], 'coefs_covariates_auto_str')
 
 
 # ---------------------------------------------------------- tuning + final
@@ -140,9 +141,10 @@ def tuning(cfg, cov, sets, fs):
 
 def final(cfg, cov, sets, fs):
     """Finalised pipeline: predictions, curves, thresholds, coefficients."""
-    # best set selected from best hand/auto/non-/stratified condition
+    # best condition from the comparison, features selected within folds
     best_fs = fs['auto_str']
-    X, y, oof_probs = evaluate.out_of_fold(sets['auto_str'][best_fs], cov)
+    selector = selection.condition_selectors['auto_str']
+    X, y, oof_probs = evaluate.out_of_fold(sets['auto_str'], cov, selector)
 
     plots.roc(y, oof_probs, cfg['results'] / 'roc_curve.png')
     plots.pr(y, oof_probs, cfg['results'] / 'pr_curve.png')
@@ -165,7 +167,20 @@ def final(cfg, cov, sets, fs):
     plots.predicted_probs(y, oof_probs, cfg['results'] / 'predicted_probs.png',
                           cfg['threshold'])
 
-    # save coefficients for best feature set
+    # unweighted variant on the same folds, used by the subgroup audit
+    print('\nunweighted variant:')
+    _, _, oof_unweighted = evaluate.out_of_fold(sets['auto_str'], cov, selector,
+                                                clf_t_unweighted)
+
+    pd.DataFrame({
+        "y": y,
+        "prob": oof_probs,
+        "prob_unweighted": oof_unweighted,
+        "sex": cov.SEX.loc[X.index].to_numpy()
+    }, index=X.index).to_csv(cfg['interim'] / 'final_predictions.csv')
+    print('saved final_predictions.csv')
+
+    # save coefficients for best feature set, fitted on all data
     save(evaluate.get_coefs(sets['auto_str'][best_fs], cov), cfg['results'], 'coefs')
 
 
@@ -179,20 +194,21 @@ def subgroup(cfg, cov, sets, fs):
     print('\nmale:\n', df[df.SEX.eq('Male')].ADHD.value_counts())
     print('\nfemale:\n', df[df.SEX.eq('Female')].ADHD.value_counts())
 
+    # v1 refit the model with SEX added as a predictor, which changes both the
+    # folds and the model being audited. Here the final model's own out-of-fold
+    # predictions are split by sex, using the unweighted variant because class
+    # weighting shifts the probabilities that calibration is measured on.
+    path = cfg['interim'] / 'final_predictions.csv'
+
+    if not path.exists():
+        raise FileNotFoundError('run the final stage first')
+
+    pred_df = pd.read_csv(path, index_col='CMID')
+    pred_df = pred_df[['y', 'prob_unweighted', 'sex']].rename(
+        columns={'prob_unweighted': 'prob'})
+
     # drop unknown SEX
-    mask = ~cov.SEX.eq('Unknown')
-    df = sets['auto_str'][fs['auto_str']].join(
-        cov.loc[mask, ['SEX']],
-        how='inner'
-    )
-
-    X, y, oof_probs = evaluate.out_of_fold(df, cov)
-
-    pred_df = pd.DataFrame({
-        "y": y,
-        "prob": oof_probs,
-        "sex": X.SEX
-    })
+    pred_df = pred_df[~pred_df.sex.eq('Unknown')]
 
     groups = {
         'All': pred_df,
@@ -203,6 +219,11 @@ def subgroup(cfg, cov, sets, fs):
     res = evaluate.subgroup_metrics(groups, cfg['threshold'])
     print(res.to_string(index=False))
     save(res, cfg['results'], 'subgroup_sex')
+
+    # bootstrap interval for each sex's AUROC and the difference between them
+    ci = evaluate.subgroup_auroc_ci(pred_df, cfg['n_boot_sub'])
+    print(ci.to_string(index=False))
+    save(ci, cfg['results'], 'subgroup_auroc_ci')
 
     # threshold selection EDA
     save(evaluate.subgroup_thresholds(groups, cfg['thresholds']),

@@ -1,6 +1,8 @@
 """Feature reduction and selection."""
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, clone
+from sklearn.feature_selection import SelectorMixin
 from sklearn.metrics import make_scorer, recall_score
 from sklearn.model_selection import RepeatedStratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
@@ -11,6 +13,43 @@ from .models import clf, preprocess, selectors, small_selectors
 # increasing n_consensus (the number of selectors selecting for that feature)
 # explores stricter, more reduced sets
 N_CONSENSUS = 2
+
+
+class ConsensusSelector(SelectorMixin, BaseEstimator):
+    """Second pass consensus as a transformer, fitted on training folds only.
+
+    v1 ran the consensus once on the whole sample and passed the resulting
+    feature list into cross-validation. Wrapping it as a scikit-learn
+    transformer puts it in the pipeline alongside the small-set selectors,
+    which were already refit per fold.
+    """
+
+    def __init__(self, selectors, n_consensus=N_CONSENSUS):
+        self.selectors = selectors
+        self.n_consensus = n_consensus
+
+    def fit(self, X, y):
+        votes = np.zeros(X.shape[1], dtype=int)
+
+        for selector in self.selectors.values():
+            votes += clone(selector).fit(X, y).get_support().astype(int)
+
+        self.votes_ = votes
+        self.support_ = votes >= self.n_consensus
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def _get_support_mask(self):
+        return self.support_
+
+
+# selector used for each feature condition, refit within every training fold
+condition_selectors = {
+    'hand_non': small_selectors['mi_k5'],
+    'hand_str': small_selectors['f_classif_k5'],
+    'auto_non': ConsensusSelector(selectors),
+    'auto_str': ConsensusSelector(selectors)
+}
 
 
 def first_pass(auto):

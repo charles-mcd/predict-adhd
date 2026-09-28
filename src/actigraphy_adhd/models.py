@@ -82,9 +82,11 @@ et_selector = ExtraTreesClassifier(
 )
 
 # second pass feature reduction selectors
-# some stochastic variation with selectors unable to pass random_state, tested to be consistent
+# mutual information is stochastic and is now refit in every fold, so a seed is
+# passed to keep runs repeatable
 selectors = {
-    "MI_top_50": SelectKBest(score_func=mutual_info_classif, k=50),
+    "MI_top_50": SelectKBest(
+        score_func=lambda X, y: mutual_info_classif(X, y, random_state=42), k=50),
     "f_classif_top_50": SelectKBest(score_func=f_classif, k=50),
     "L1_SelectFromModel": SelectFromModel(l1_selector),
     "ElasticNet_SelectFromModel": SelectFromModel(elastic_selector),
@@ -94,7 +96,8 @@ selectors = {
 # small set selectors (more intensive, use on handcrafted and already reduced automatic features)
 small_selectors = {
     "none": "passthrough",
-    "mi_k5": SelectKBest(mutual_info_classif, k=5),
+    "mi_k5": SelectKBest(
+        lambda X, y: mutual_info_classif(X, y, random_state=42), k=5),
     "f_classif_k5": SelectKBest(f_classif, k=5),
     "f_classif_k10": SelectKBest(f_classif, k=10),
     "rfe_k5": RFE(clf, n_features_to_select=5, step=1),
@@ -165,6 +168,17 @@ clf_t = LogisticRegression(
             C=0.1,
             l1_ratio=0,
             class_weight='balanced',
+            solver="saga",
+            max_iter=10000,
+            random_state=42
+)
+
+# unweighted variant of the tuned model, used for the subgroup audit: class
+# weighting shifts predicted probabilities, which calibration depends on
+clf_t_unweighted = LogisticRegression(
+            C=0.1,
+            l1_ratio=0,
+            class_weight=None,
             solver="saga",
             max_iter=10000,
             random_state=42
