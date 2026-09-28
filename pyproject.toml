@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "actigraphy-adhd"
+version = "0.1.0"
+description = "ADHD prediction from Millennium Cohort Study actigraphy"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn>=1.8",
+    "scipy",
+    "statsmodels",
+    "matplotlib",
+    "pyyaml",
+    "tsfresh",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

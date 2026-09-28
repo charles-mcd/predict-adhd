@@ -1,0 +1,12 @@
+# Paths and run options. Analysis parameters are in the code:
+# consensus level in selection.py, models and classifiers in models.py.
+
+paths:
+  raw: data/MCS                   # MCS files from the UK Data Service, incl. dat/
+  precomputed: data/precomputed   # cov.csv, hand.csv, auto.csv (restricted, not in the repo)
+  interim: data/interim           # saved outputs of the slow steps
+  results: results
+
+threshold: 0.01     # prediction threshold for the subgroup analysis, optimised via EDA
+thresholds: [0.5, 0.1, 0.05, 0.01, 0.005, 0.003, 0.001]   # threshold selection EDA
+n_boot: 5000        # bootstrap resamples for the duration comparison

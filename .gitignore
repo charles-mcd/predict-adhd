@@ -1,0 +1,11 @@
+# restricted data and saved intermediates: never commit
+data/
+
+# results are checked for disclosure before anything is published
+results/
+
+# python and jupyter
+__pycache__/
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
